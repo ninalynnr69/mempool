@@ -1,10 +1,10 @@
 import { Component, Inject, LOCALE_ID, OnInit } from '@angular/core';
 import { Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
-import { ApiService } from '../../services/api.service';
+import { ApiService } from '@app/services/api.service';
 import { formatNumber } from '@angular/common';
-import { selectPowerOfTen } from '../../bitcoin.utils';
-import { StateService } from '../../services/state.service';
+import { AmountShortenerPipe } from '@app/shared/pipes/amount-shortener.pipe';
+import { StateService } from '@app/services/state.service';
 
 @Component({
   selector: 'app-difficulty-adjustments-table',
@@ -27,6 +27,7 @@ export class DifficultyAdjustmentsTable implements OnInit {
   constructor(
     @Inject(LOCALE_ID) public locale: string,
     private apiService: ApiService,
+    public amountShortenerPipe: AmountShortenerPipe,
     public stateService: StateService
   ) {
   }
@@ -43,14 +44,11 @@ export class DifficultyAdjustmentsTable implements OnInit {
           const data = response.body;
           const tableData = [];
           for (const adjustment of data) {
-            const selectedPowerOfTen: any = selectPowerOfTen(adjustment[2]);
             tableData.push({
               height: adjustment[1],
               timestamp: adjustment[0],
               change: (adjustment[3] - 1) * 100,
-              difficultyShorten: formatNumber(
-                adjustment[2] / selectedPowerOfTen.divider,
-                this.locale, `1.${decimals}-${decimals}`) + selectedPowerOfTen.unit
+              difficultyShorten: this.amountShortenerPipe.transform(adjustment[2], decimals)
             });
           }
           this.isLoading = false;

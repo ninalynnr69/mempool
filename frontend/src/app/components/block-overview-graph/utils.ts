@@ -1,6 +1,6 @@
-import { feeLevels, defaultMempoolFeeColors, contrastMempoolFeeColors } from '../../app.constants';
-import { Color } from './sprite-types';
-import TxView from './tx-view';
+import { feeLevels, defaultMempoolFeeColors, contrastMempoolFeeColors } from '@app/app.constants';
+import { Color } from '@components/block-overview-graph/sprite-types';
+import TxView from '@components/block-overview-graph/tx-view';
 
 export function hexToColor(hex: string): Color {
   return {
@@ -9,6 +9,10 @@ export function hexToColor(hex: string): Color {
     b: parseInt(hex.slice(4, 6), 16) / 255,
     a: hex.length > 6 ? parseInt(hex.slice(6, 8), 16) / 255 : 1
   };
+}
+
+export function colorToHex(color: Color): string {
+  return [color.r, color.g, color.b].map(c => Math.max(0, Math.min(Math.round(c * 255), 255)).toString(16)).join('');
 }
 
 export function desaturate(color: Color, amount: number): Color {
@@ -27,6 +31,17 @@ export function darken(color: Color, amount: number): Color {
     g: color.g * amount,
     b: color.b * amount,
     a: color.a,
+  };
+}
+
+export function mix(color1: Color, color2: Color, amount: number): Color {
+  // clamp to 0-1
+  amount = Math.max(0, Math.min(amount, 1));
+  return {
+    r: color1.r * (1 - amount) + color2.r * amount,
+    g: color1.g * (1 - amount) + color2.g * amount,
+    b: color1.b * (1 - amount) + color2.b * amount,
+    a: color1.a * (1 - amount) + color2.a * amount,
   };
 }
 
@@ -50,7 +65,7 @@ const defaultColors: { [key: string]: ColorPalette } = {
     base: defaultMempoolFeeColors.map(hexToColor),
     audit: [],
     marginal: [],
-    baseLevel: (tx: TxView, rate: number) => feeLevels.findIndex((feeLvl) => Math.max(1, rate) < feeLvl) - 1
+    baseLevel: (tx: TxView, rate: number) => feeLevels.findIndex((feeLvl) => Math.max(0, rate) < feeLvl) - 1
   },
 }
 for (const key in defaultColors) {
@@ -81,7 +96,7 @@ const contrastColors: { [key: string]: ColorPalette } = {
     base: contrastMempoolFeeColors.map(hexToColor),
     audit: [],
     marginal: [],
-    baseLevel: (tx: TxView, rate: number) => feeLevels.findIndex((feeLvl) => Math.max(1, rate) < feeLvl) - 1
+    baseLevel: (tx: TxView, rate: number) => feeLevels.findIndex((feeLvl) => Math.max(0, rate) < feeLvl) - 1
   },
 }
 for (const key in contrastColors) {
@@ -141,6 +156,10 @@ export function defaultColorFunction(
     case 'added_prioritized':
       return auditColors.added_prioritized;
     case 'prioritized':
+      return auditColors.prioritized;
+    case 'added_deprioritized':
+      return auditColors.added_prioritized;
+    case 'deprioritized':
       return auditColors.prioritized;
     case 'selected':
       return colors.marginal[levelIndex] || colors.marginal[defaultMempoolFeeColors.length - 1];

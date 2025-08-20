@@ -1,17 +1,17 @@
 import { Component, Inject, Input, LOCALE_ID, OnInit, HostBinding, OnChanges, SimpleChanges } from '@angular/core';
-import { echarts, EChartsOption } from '../../graphs/echarts';
+import { echarts, EChartsOption } from '@app/graphs/echarts';
 import { Observable, combineLatest, fromEvent } from 'rxjs';
 import { map, share, startWith, switchMap, tap } from 'rxjs/operators';
-import { SeoService } from '../../services/seo.service';
+import { SeoService } from '@app/services/seo.service';
 import { formatNumber } from '@angular/common';
 import { UntypedFormBuilder, UntypedFormGroup } from '@angular/forms';
-import { StorageService } from '../../services/storage.service';
-import { MiningService } from '../../services/mining.service';
-import { download } from '../../shared/graphs.utils';
-import { LightningApiService } from '../lightning-api.service';
-import { AmountShortenerPipe } from '../../shared/pipes/amount-shortener.pipe';
-import { isMobile } from '../../shared/common.utils';
-import { StateService } from '../../services/state.service';
+import { StorageService } from '@app/services/storage.service';
+import { MiningService } from '@app/services/mining.service';
+import { download } from '@app/shared/graphs.utils';
+import { LightningApiService } from '@app/lightning/lightning-api.service';
+import { AmountShortenerPipe } from '@app/shared/pipes/amount-shortener.pipe';
+import { isMobile } from '@app/shared/common.utils';
+import { StateService } from '@app/services/state.service';
 
 @Component({
   selector: 'app-lightning-statistics-chart',
@@ -120,7 +120,7 @@ export class LightningStatisticsChartComponent implements OnInit, OnChanges {
           color: 'grey',
           fontSize: 15
         },
-        text: $localize`Indexing in progress`,
+        text: $localize`:@@af1176facd00a0580509fb2900ab0cf7f9b39ae7:Indexing in progress`,
         left: 'center',
         top: 'center'
       };

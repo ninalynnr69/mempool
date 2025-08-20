@@ -1,6 +1,6 @@
 import { Component, Input, Output, OnChanges, EventEmitter, HostListener, OnInit, ViewChild, ElementRef, AfterViewInit, OnDestroy, ChangeDetectorRef } from '@angular/core';
-import { Transaction } from '../../interfaces/electrs.interface';
-import { AccelerationEstimate, RateOption } from './accelerate-checkout.component';
+import { Transaction } from '@interfaces/electrs.interface';
+import { AccelerationEstimate, RateOption } from '@components/accelerate-checkout/accelerate-checkout.component';
 
 interface GraphBar {
   rate: number;
@@ -88,7 +88,7 @@ export class AccelerateFeeGraphComponent implements OnInit, AfterViewInit, OnCha
         rate: option.rate,
         height: lastHeight,
         class: 'max',
-        label: this.showEstimate ? $localize`maximum` : $localize`accelerated`,
+        label: this.showEstimate ? $localize`maximum` : $localize`:@@b484583f0ce10f3341ab36750d05271d9d22c9a1:Accelerated`.toLowerCase(),
         active: option.index === this.maxRateIndex,
         rateIndex: option.index,
         fee: option.fee,

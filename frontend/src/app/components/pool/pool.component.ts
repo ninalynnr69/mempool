@@ -1,15 +1,18 @@
 import { ChangeDetectionStrategy, Component, Inject, Input, LOCALE_ID, OnInit } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
-import { echarts, EChartsOption } from '../../graphs/echarts';
+import { echarts, EChartsOption } from '@app/graphs/echarts';
 import { BehaviorSubject, Observable, Subscription, combineLatest, of } from 'rxjs';
 import { catchError, distinctUntilChanged, filter, map, share, switchMap, tap } from 'rxjs/operators';
-import { BlockExtended, PoolStat } from '../../interfaces/node-api.interface';
-import { ApiService } from '../../services/api.service';
-import { StateService } from '../../services/state.service';
-import { selectPowerOfTen } from '../../bitcoin.utils';
+import { BlockExtended, PoolStat } from '@interfaces/node-api.interface';
+import { ApiService } from '@app/services/api.service';
+import { StateService } from '@app/services/state.service';
+import { AmountShortenerPipe } from '@app/shared/pipes/amount-shortener.pipe';
 import { formatNumber } from '@angular/common';
-import { SeoService } from '../../services/seo.service';
+import { SeoService } from '@app/services/seo.service';
 import { HttpErrorResponse } from '@angular/common/http';
+import { StratumJob } from '@interfaces/websocket.interface';
+import { WebsocketService } from '@app/services/websocket.service';
+import { MiningService } from '@app/services/mining.service';
 
 interface AccelerationTotal {
   cost: number,
@@ -27,12 +30,16 @@ export class PoolComponent implements OnInit {
   @Input() left: number | string = 75;
 
   gfg = true;
+  stratumEnabled = this.stateService.env.STRATUM_ENABLED;
 
   formatNumber = formatNumber;
+  Math = Math;
   slugSubscription: Subscription;
   poolStats$: Observable<PoolStat>;
   blocks$: Observable<BlockExtended[]>;
   oobFees$: Observable<AccelerationTotal[]>;
+  job$: Observable<StratumJob | null>;
+  expectedBlockTime$: Observable<number>;
   isLoading = true;
   error: HttpErrorResponse | null = null;
 
@@ -53,7 +60,10 @@ export class PoolComponent implements OnInit {
     private apiService: ApiService,
     private route: ActivatedRoute,
     public stateService: StateService,
+    private websocketService: WebsocketService,
+    private miningService: MiningService,
     private seoService: SeoService,
+    public amountShortenerPipe: AmountShortenerPipe,
   ) {
     this.auditAvailable = this.stateService.env.AUDIT;
   }
@@ -62,7 +72,7 @@ export class PoolComponent implements OnInit {
     this.slugSubscription = this.route.params.pipe(map((params) => params.slug)).subscribe((slug) => {
       this.isLoading = true;
       this.blocks = [];
-      this.chartOptions = {};  
+      this.chartOptions = {};
       this.slug = slug;
       this.initializeObservables();
     });
@@ -129,6 +139,31 @@ export class PoolComponent implements OnInit {
       }),
       filter(oob => oob.length === 3 && oob[2].count > 0)
     );
+
+    if (this.stratumEnabled) {
+      this.job$ = combineLatest([
+        this.poolStats$.pipe(
+          tap((poolStats) => {
+            this.websocketService.startTrackStratum(poolStats.pool.unique_id);
+          })
+        ),
+        this.stateService.stratumJobs$
+      ]).pipe(
+        map(([poolStats, jobs]) => {
+          return jobs[poolStats.pool.unique_id];
+        })
+      );
+
+      this.expectedBlockTime$ = combineLatest([
+        this.miningService.getMiningStats('1w'),
+        this.poolStats$,
+        this.stateService.difficultyAdjustment$
+      ]).pipe(
+        map(([miningStats, poolStat, da]) => {
+          return (da.timeAvg / ((poolStat.estimatedHashrate || 0) / (miningStats.lastEstimatedHashrate * 1_000_000_000_000_000_000))) + Date.now() + da.timeOffset;
+        })
+      );
+    }
   }
 
   prepareChartOptions(hashrate, share) {
@@ -183,9 +218,7 @@ export class PoolComponent implements OnInit {
 
           for (const tick of ticks) {
             if (tick.seriesIndex === 0) {
-              let hashratePowerOfTen = selectPowerOfTen(tick.data[1], 10);
-              let hashrateData = tick.data[1] / hashratePowerOfTen.divider;
-              hashrateString = `${tick.marker} ${tick.seriesName}: ${formatNumber(hashrateData, this.locale, '1.0-0')} ${hashratePowerOfTen.unit}H/s<br>`;
+              hashrateString = `${tick.marker} ${tick.seriesName}: ${this.amountShortenerPipe.transform(tick.data[1], 3, 'H/s', false, true)}<br>`;
             } else if (tick.seriesIndex === 1) {
               dominanceString = `${tick.marker} ${tick.seriesName}: ${formatNumber(tick.data[1], this.locale, '1.0-2')}%`;
             }             
@@ -237,9 +270,7 @@ export class PoolComponent implements OnInit {
           axisLabel: {
             color: 'rgb(110, 112, 121)',
             formatter: (val) => {
-              const selectedPowerOfTen: any = selectPowerOfTen(val);
-              const newVal = Math.round(val / selectedPowerOfTen.divider);
-              return `${newVal} ${selectedPowerOfTen.unit}H/s`
+              return this.amountShortenerPipe.transform(val, 3, 'H/s', false, true).toString();
             }
           },
           splitLine: {
@@ -325,6 +356,10 @@ export class PoolComponent implements OnInit {
 
   trackByBlock(index: number, block: BlockExtended) {
     return block.height;
+  }
+
+  reverseHash(hash: string) {
+    return hash.match(/../g).reverse().join('');
   }
 
   ngOnDestroy(): void {

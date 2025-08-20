@@ -8,9 +8,9 @@ import transactionUtils from './transaction-utils';
 import { isPoint } from '../utils/secp256k1';
 import logger from '../logger';
 import { getVarIntLength, opcodes, parseMultisigScript } from '../utils/bitcoin-script';
+import { IEsploraApi } from './bitcoin/esplora-api.interface';
 
 // Bitcoin Core default policy settings
-const TX_MAX_STANDARD_VERSION = 2;
 const MAX_STANDARD_TX_WEIGHT = 400_000;
 const MAX_BLOCK_SIGOPS_COST = 80_000;
 const MAX_STANDARD_TX_SIGOPS_COST = (MAX_BLOCK_SIGOPS_COST / 5);
@@ -80,8 +80,8 @@ export class Common {
     return arr;
   }
 
-  static findRbfTransactions(added: MempoolTransactionExtended[], deleted: MempoolTransactionExtended[], forceScalable = false): { [txid: string]: MempoolTransactionExtended[] } {
-    const matches: { [txid: string]: MempoolTransactionExtended[] } = {};
+  static findRbfTransactions(added: MempoolTransactionExtended[], deleted: MempoolTransactionExtended[], forceScalable = false): { [txid: string]: { replaced: MempoolTransactionExtended[], replacedBy: TransactionExtended }} {
+    const matches: { [txid: string]: { replaced: MempoolTransactionExtended[], replacedBy: TransactionExtended }} = {};
 
     // For small N, a naive nested loop is extremely fast, but it doesn't scale
     if (added.length < 1000 && deleted.length < 50 && !forceScalable) {
@@ -96,7 +96,7 @@ export class Common {
               addedTx.vin.some((vin) => vin.txid === deletedVin.txid && vin.vout === deletedVin.vout));
             });
         if (foundMatches?.length) {
-          matches[addedTx.txid] = [...new Set(foundMatches)];
+          matches[addedTx.txid] = { replaced: [...new Set(foundMatches)], replacedBy: addedTx };
         }
       });
     } else {
@@ -124,7 +124,7 @@ export class Common {
             foundMatches.add(deletedTx);
           }
           if (foundMatches.size) {
-            matches[addedTx.txid] = [...foundMatches];
+            matches[addedTx.txid] = { replaced: [...foundMatches], replacedBy: addedTx };
           }
         }
       }
@@ -139,17 +139,17 @@ export class Common {
       const replaced: Set<MempoolTransactionExtended> = new Set();
       for (let i = 0; i < tx.vin.length; i++) {
         const vin = tx.vin[i];
-        const match = spendMap.get(`${vin.txid}:${vin.vout}`);
+        const key = `${vin.txid}:${vin.vout}`;
+        const match = spendMap.get(key);
         if (match && match.txid !== tx.txid) {
           replaced.add(match);
           // remove this tx from the spendMap
           // prevents the same tx being replaced more than once
           for (const replacedVin of match.vin) {
-            const key = `${replacedVin.txid}:${replacedVin.vout}`;
-            spendMap.delete(key);
+            const replacedKey = `${replacedVin.txid}:${replacedVin.vout}`;
+            spendMap.delete(replacedKey);
           }
         }
-        const key = `${vin.txid}:${vin.vout}`;
         spendMap.delete(key);
       }
       if (replaced.size) {
@@ -200,10 +200,13 @@ export class Common {
    *
    * returns true early if any standardness rule is violated, otherwise false
    * (except for non-mandatory-script-verify-flag and p2sh script evaluation rules which are *not* enforced)
+   *
+   * As standardness rules change, we'll need to apply the rules in force *at the time* to older blocks.
+   * For now, just pull out individual rules into versioned functions where necessary.
    */
-  static isNonStandard(tx: TransactionExtended): boolean {
+  static isNonStandard(tx: TransactionExtended, height?: number): boolean {
     // version
-    if (tx.version > TX_MAX_STANDARD_VERSION) {
+    if (this.isNonStandardVersion(tx, height)) {
       return true;
     }
 
@@ -250,8 +253,35 @@ export class Common {
         }
       } else if (['unknown', 'provably_unspendable', 'empty'].includes(vin.prevout?.scriptpubkey_type || '')) {
         return true;
+      } else if (vin.prevout?.scriptpubkey_type === 'anchor' && this.isNonStandardAnchor(vin, height)) {
+        return true;
       }
-      // TODO: bad-witness-nonstandard
+      // bad-witness-nonstandard
+      if (vin.prevout?.scriptpubkey_type === 'v1_p2tr' && vin.witness?.length) {
+        const hasAnnex = vin.witness.length > 1 && vin.witness[vin.witness.length - 1].startsWith('50');
+        // annex is non-standard
+        if (hasAnnex) {
+          return true;
+        }
+        if (vin.witness.length > (hasAnnex ? 2 : 1)) {
+          // script path spend
+          const controlBlock = vin.witness[vin.witness.length - (hasAnnex ? 2 : 1)];
+          // control block is required
+          if (!controlBlock.length) {
+            return false;
+          } else {
+            // Leaf version must be 0xc0 (aka Tapscript, see BIP 342)
+            if ((parseInt(controlBlock.slice(0, 2), 16) & 0xfe) !== 0xc0) {
+              return false;
+            }
+          }
+          // remaining witness items (except for the script) must be within MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE limit
+          if (vin.witness.slice(0, vin.witness.length - (hasAnnex ? 3 : 2)).some(v => v.length > 160)) {
+            return false;
+          }
+        }
+      }
+      // TODO: other bad-witness-nonstandard cases
     }
 
     // output validation
@@ -299,7 +329,7 @@ export class Common {
         }
         if (vout.value < (dustSize * DUST_RELAY_TX_FEE)) {
           // under minimum output size
-          return true;
+          return !Common.isStandardEphemeralDust(tx, height);
         }
       }
     }
@@ -331,6 +361,70 @@ export class Common {
         version: version ? version - 0x50 : 0,
         program: scriptpubkey.slice(4),
       };
+    }
+    return false;
+  }
+
+  // Individual versioned standardness rules
+
+  static V3_STANDARDNESS_ACTIVATION_HEIGHT = {
+    'testnet4': 42_000,
+    'testnet': 2_900_000,
+    'signet': 211_000,
+    '': 863_500,
+  };
+  static isNonStandardVersion(tx: TransactionExtended, height?: number): boolean {
+    let TX_MAX_STANDARD_VERSION = 3;
+    if (
+      height != null
+      && this.V3_STANDARDNESS_ACTIVATION_HEIGHT[config.MEMPOOL.NETWORK]
+      && height <= this.V3_STANDARDNESS_ACTIVATION_HEIGHT[config.MEMPOOL.NETWORK]
+    ) {
+      // V3 transactions were non-standard to spend before v28.x (scheduled for 2024/09/30 https://github.com/bitcoin/bitcoin/issues/29891)
+      TX_MAX_STANDARD_VERSION = 2;
+    }
+
+    if (tx.version > TX_MAX_STANDARD_VERSION) {
+      return true;
+    }
+    return false;
+  }
+
+  static ANCHOR_STANDARDNESS_ACTIVATION_HEIGHT = {
+    'testnet4': 42_000,
+    'testnet': 2_900_000,
+    'signet': 211_000,
+    '': 863_500,
+  };
+  static isNonStandardAnchor(vin: IEsploraApi.Vin, height?: number): boolean {
+    if (
+      height != null
+      && this.ANCHOR_STANDARDNESS_ACTIVATION_HEIGHT[config.MEMPOOL.NETWORK]
+      && height <= this.ANCHOR_STANDARDNESS_ACTIVATION_HEIGHT[config.MEMPOOL.NETWORK]
+      && vin.prevout?.scriptpubkey === '51024e73'
+    ) {
+      // anchor outputs were non-standard to spend before v28.x (scheduled for 2024/09/30 https://github.com/bitcoin/bitcoin/issues/29891)
+      return true;
+    }
+    return false;
+  }
+
+  // Ephemeral dust is a new concept that allows a single dust output in a transaction, provided the transaction is zero fee
+  static EPHEMERAL_DUST_STANDARDNESS_ACTIVATION_HEIGHT = {
+    'testnet4': 90_500,
+    'testnet': 4_550_000,
+    'signet': 260_000,
+    '': 905_000,
+  };
+  static isStandardEphemeralDust(tx: TransactionExtended, height?: number): boolean {
+    if (
+      tx.fee === 0
+      && (height == null || (
+        this.EPHEMERAL_DUST_STANDARDNESS_ACTIVATION_HEIGHT[config.MEMPOOL.NETWORK]
+        && height >= this.EPHEMERAL_DUST_STANDARDNESS_ACTIVATION_HEIGHT[config.MEMPOOL.NETWORK]
+      ))
+    ) {
+      return true;
     }
     return false;
   }
@@ -415,7 +509,52 @@ export class Common {
     return flags;
   }
 
-  static getTransactionFlags(tx: TransactionExtended): number {
+  static inputIsMaybeInscription(vin: IEsploraApi.Vin): boolean {
+    // check if this is actually a taproot input
+    let isTaproot = false;
+    let isNotTaproot = false;
+
+    // taproot inputs have no scriptsig (otherwise probably wrapped segwit)
+    if (vin.scriptsig?.length) {
+      isNotTaproot = true;
+    }
+
+    // p2wpkh consist of a DER-encoded signature followed by a compressed pubkey
+    if (!isNotTaproot
+      && this.isDERSig(vin.witness[0])
+      && (vin.witness[1].startsWith('02') || vin.witness[1].startsWith('03'))
+      && vin.witness[1].length === 66) {
+      isNotTaproot = true;
+    }
+
+    // p2wsh could be almost anything, but ends with a script which
+    // probably doesn't match a valid taproot control block length (32 + 33m)
+    if (!isNotTaproot
+      && vin.witness.length >= 2
+    ) {
+      const hasAnnex = vin.witness[vin.witness.length - 1].startsWith('50');
+      const controlBlock = vin.witness[vin.witness.length - (hasAnnex ? 2 : 1)];
+      if ((controlBlock.length - 66) % 64 === 0) {
+        isNotTaproot = true;
+      }
+    }
+
+    // signed taproot inscriptions should have 3 non-annex witness items:
+    //  1) schnorr signature
+    //  2) inscription script
+    //  3) control block (length 33 + 32m)
+    if (!isTaproot
+      && vin.witness.length >= 3
+      && vin.witness[0].length === 128 || vin.witness[0].length === 130
+      && (vin.witness[2].length - 66) % 64 === 0
+    ) {
+      isTaproot = true;
+    }
+
+    return isTaproot || !isNotTaproot;
+  }
+
+  static getTransactionFlags(tx: TransactionExtended, height?: number): number {
     let flags = tx.flags ? BigInt(tx.flags) : 0n;
 
     // Update variable flags (CPFP, RBF)
@@ -466,12 +605,17 @@ export class Common {
             flags |= TransactionFlags.p2tr;
             if (vin.witness?.length) {
               flags = Common.isInscription(vin, flags);
+              const hasAnnex = vin.witness.length > 1 && vin.witness[vin.witness.length - 1].startsWith('50');
+              if (hasAnnex) {
+                flags |= TransactionFlags.annex;
+              }
             }
           } break;
         }
       } else {
         // no prevouts, optimistically check witness-bearing inputs
-        if (vin.witness?.length >= 2) {
+        if (vin.witness?.length >= 2 && Common.inputIsMaybeInscription(vin)) {
+          // try to parse the witness as a taproot inscription
           try {
             flags = Common.isInscription(vin, flags);
           } catch {
@@ -548,7 +692,7 @@ export class Common {
     if (hasFakePubkey) {
       flags |= TransactionFlags.fake_pubkey;
     }
-    
+
     // fast but bad heuristic to detect possible coinjoins
     // (at least 5 inputs and 5 outputs, less than half of which are unique amounts, with no address reuse)
     const addressReuse = Object.keys(reusedOutputAddresses).reduce((acc, key) => Math.max(acc, (reusedInputAddresses[key] || 0) + (reusedOutputAddresses[key] || 0)), 0) > 1;
@@ -564,17 +708,17 @@ export class Common {
       flags |= TransactionFlags.batch_payout;
     }
 
-    if (this.isNonStandard(tx)) {
+    if (this.isNonStandard(tx, height)) {
       flags |= TransactionFlags.nonstandard;
     }
 
     return Number(flags);
   }
 
-  static classifyTransaction(tx: TransactionExtended): TransactionClassified {
+  static classifyTransaction(tx: TransactionExtended, height?: number): TransactionClassified {
     let flags = 0;
     try {
-      flags = Common.getTransactionFlags(tx);
+      flags = Common.getTransactionFlags(tx, height);
     } catch (e) {
       logger.warn('Failed to add classification flags to transaction: ' + (e instanceof Error ? e.message : e));
     }
@@ -585,8 +729,8 @@ export class Common {
     };
   }
 
-  static classifyTransactions(txs: TransactionExtended[]): TransactionClassified[] {
-    return txs.map(Common.classifyTransaction);
+  static classifyTransactions(txs: TransactionExtended[], height?: number): TransactionClassified[] {
+    return txs.map(tx => Common.classifyTransaction(tx, height));
   }
 
   static stripTransaction(tx: TransactionExtended): TransactionStripped {
@@ -672,6 +816,13 @@ export class Common {
     return (
       Common.indexingEnabled() &&
       config.MEMPOOL.BLOCKS_SUMMARIES_INDEXING === true
+    );
+  }
+
+  static auditIndexingEnabled(): boolean {
+    return (
+      Common.indexingEnabled() &&
+      config.MEMPOOL.AUDIT === true
     );
   }
 
@@ -809,14 +960,16 @@ export class Common {
     }
   }
 
-  static calcEffectiveFeeStatistics(transactions: { weight: number, fee: number, effectiveFeePerVsize?: number, txid: string, acceleration?: boolean }[]): EffectiveFeeStats {
+  static calcEffectiveFeeStatistics(transactions: { weight: number, fee?: number, effectiveFeePerVsize?: number, txid: string, acceleration?: boolean }[]): EffectiveFeeStats {
     const sortedTxs = transactions.map(tx => { return { txid: tx.txid, weight: tx.weight, rate: tx.effectiveFeePerVsize || ((tx.fee || 0) / (tx.weight / 4)) }; }).sort((a, b) => a.rate - b.rate);
+    const totalWeight = transactions.reduce((acc, tx) => acc + tx.weight, 0);
 
-    let weightCount = 0;
+    // include any unused space
+    let weightCount = config.MEMPOOL.BLOCK_WEIGHT_UNITS - totalWeight;
     let medianFee = 0;
     let medianWeight = 0;
 
-    // calculate the "medianFee" as the average fee rate of the middle 0.25% weight units of transactions
+    // calculate the "medianFee" as the average fee rate of the middle 0.25% weight units of the conceptual block
     const halfWidth = config.MEMPOOL.BLOCK_WEIGHT_UNITS / 800;
     const leftBound = Math.floor((config.MEMPOOL.BLOCK_WEIGHT_UNITS / 2) - halfWidth);
     const rightBound = Math.ceil((config.MEMPOOL.BLOCK_WEIGHT_UNITS / 2) + halfWidth);

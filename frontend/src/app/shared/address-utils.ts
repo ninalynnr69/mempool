@@ -1,7 +1,7 @@
 import '@angular/localize/init';
-import { ScriptInfo } from './script.utils';
-import { Vin, Vout } from '../interfaces/electrs.interface';
-import { BECH32_CHARS_LW, BASE58_CHARS, HEX_CHARS } from './regex.utils';
+import { ScriptInfo } from '@app/shared/script.utils';
+import { Vin, Vout } from '@interfaces/electrs.interface';
+import { BECH32_CHARS_LW, BASE58_CHARS, HEX_CHARS } from '@app/shared/regex.utils';
 
 export type AddressType = 'fee'
   | 'empty'
@@ -17,6 +17,7 @@ export type AddressType = 'fee'
   | 'v0_p2wsh'
   | 'v1_p2tr'
   | 'confidential'
+  | 'anchor'
   | 'unknown'
 
 const ADDRESS_PREFIXES = {
@@ -77,6 +78,7 @@ const p2trRegex = RegExp('^p' + BECH32_CHARS_LW + '{58}$');
 const pubkeyRegex = RegExp('^' + `(04${HEX_CHARS}{128})|(0[23]${HEX_CHARS}{64})$`);
 
 export function detectAddressType(address: string, network: string): AddressType {
+  network = network || 'mainnet';
   // normal address types
   const firstChar = address.substring(0, 1);
   if (ADDRESS_PREFIXES[network].base58.pubkey.includes(firstChar) && base58Regex.test(address.slice(1))) {
@@ -126,6 +128,7 @@ export class AddressTypeInfo {
   // flags
   isMultisig?: { m: number, n: number };
   tapscript?: boolean;
+  simplicity?: boolean;
 
   constructor (network: string, address: string, type?: AddressType, vin?: Vin[], vout?: Vout) {
     this.network = network;
@@ -150,14 +153,26 @@ export class AddressTypeInfo {
     return cloned;
   }
 
-  public processInputs(vin: Vin[] = []): void {
+  public processInputs(vin: Vin[] = [], vinIds: string[] = []): void {
     // taproot can have multiple script paths
     if (this.type === 'v1_p2tr') {
-      for (const v of vin) {
-        if (v.inner_witnessscript_asm) {
-          this.tapscript = true;
-          const controlBlock = v.witness[v.witness.length - 1].startsWith('50') ? v.witness[v.witness.length - 2] : v.witness[v.witness.length - 1];
-          this.processScript(new ScriptInfo('inner_witnessscript', undefined, v.inner_witnessscript_asm, v.witness, controlBlock));
+      for (let i = 0; i < vin.length; i++) {
+        const v = vin[i];
+        const hasAnnex = v.witness[v.witness.length - 1].startsWith('50');
+        const isScriptSpend = v.witness.length > (hasAnnex ? 2 : 1);
+        if (isScriptSpend) {
+          const controlBlock = hasAnnex ? v.witness[v.witness.length - 2] : v.witness[v.witness.length - 1];
+          const scriptHex = hasAnnex ? v.witness[v.witness.length - 3] : v.witness[v.witness.length - 2];
+          const tapleafVersion = parseInt(controlBlock.slice(0, 2), 16) & 0xfe;
+
+          if (tapleafVersion === 0xc0 && v.inner_witnessscript_asm) {
+            this.tapscript = true;
+            this.processScript(new ScriptInfo('inner_witnessscript', scriptHex, v.inner_witnessscript_asm, v.witness, controlBlock, vinIds?.[i]));
+          } else if (this.network === 'liquid' || this.network === 'liquidtestnet' && tapleafVersion === 0xbe) {
+            this.simplicity = true;
+            v.inner_simplicityscript = v.witness[1];
+            this.processScript(new ScriptInfo('inner_simplicityscript', scriptHex, null, v.witness, controlBlock, vinIds?.[i]));
+          }
         }
       }
     // for single-script types, if we've seen one input we've seen them all
@@ -188,6 +203,12 @@ export class AddressTypeInfo {
         const v = vin[0];
         this.processScript(new ScriptInfo('scriptpubkey', v.prevout.scriptpubkey, v.prevout.scriptpubkey_asm));
       }
+    } else if (this.type === 'unknown') {
+      for (const v of vin) {
+        if (v.prevout?.scriptpubkey === '51024e73') {
+          this.type = 'anchor';
+        }
+      }
     }
     // and there's nothing more to learn from processing inputs for other types
   }
@@ -197,13 +218,164 @@ export class AddressTypeInfo {
       if (!this.scripts.size) {
         this.processScript(new ScriptInfo('scriptpubkey', output.scriptpubkey, output.scriptpubkey_asm));
       }
+    } else if (this.type === 'unknown') {
+      if (output.scriptpubkey === '51024e73') {
+        this.type = 'anchor';
+      }
     }
   }
 
+  public compareTo(other: AddressTypeInfo): AddressSimilarityResult {
+    return compareAddresses(this.address, other.address, this.network);
+  }
+
+  public compareToString(other: string): AddressSimilarityResult {
+    if (other === this.address) {
+      return { status: 'identical' };
+    }
+    const otherInfo = new AddressTypeInfo(this.network, other);
+    return this.compareTo(otherInfo);
+  }
+
   private processScript(script: ScriptInfo): void {
+    if (this.scripts.has(script.key)) {
+      return;
+    }
     this.scripts.set(script.key, script);
     if (script.template?.type === 'multisig') {
       this.isMultisig = { m: script.template['m'], n: script.template['n'] };
     }
   }
 }
+
+export interface AddressMatch {
+  prefix: string;
+  postfix: string;
+}
+
+export interface AddressSimilarity {
+  status: 'comparable';
+  score: number;
+  left: AddressMatch;
+  right: AddressMatch;
+}
+export type AddressSimilarityResult =
+  | { status: 'identical' }
+  | { status: 'incomparable' }
+  | AddressSimilarity;
+
+export const ADDRESS_SIMILARITY_THRESHOLD = 10_000_000; // 1 false positive per ~10 million comparisons
+
+function fuzzyPrefixMatch(a: string, b: string, rtl: boolean = false): { score: number, matchA: string, matchB: string } {
+  let score = 0;
+  let gap = false;
+  let done = false;
+
+  let ai = 0;
+  let bi = 0;
+  let prefixA = '';
+  let prefixB = '';
+  if (rtl) {
+    a = a.split('').reverse().join('');
+    b = b.split('').reverse().join('');
+  }
+
+  while (ai < a.length && bi < b.length && !done) {
+    if (a[ai] === b[bi]) {
+      // matching characters
+      prefixA += a[ai];
+      prefixB += b[bi];
+      score++;
+      ai++;
+      bi++;
+    } else if (!gap) {
+      // try looking ahead in both strings to find the best match
+      const nextMatchA = (ai + 1 < a.length && a[ai + 1] === b[bi]);
+      const nextMatchB = (bi + 1 < b.length && a[ai] === b[bi + 1]);
+      const nextMatchBoth = (ai + 1 < a.length && bi + 1 < b.length && a[ai + 1] === b[bi + 1]);
+      if (nextMatchBoth) {
+        // single differing character
+        prefixA += a[ai];
+        prefixB += b[bi];
+        ai++;
+        bi++;
+      } else if (nextMatchA) {
+        // character missing in b
+        prefixA += a[ai];
+        ai++;
+      } else if (nextMatchB) {
+        // character missing in a
+        prefixB += b[bi];
+        bi++;
+      } else {
+        ai++;
+        bi++;
+      }
+      gap = true;
+    } else {
+      done = true;
+    }
+  }
+
+  if (rtl) {
+    prefixA = prefixA.split('').reverse().join('');
+    prefixB = prefixB.split('').reverse().join('');
+  }
+
+  return { score, matchA: prefixA, matchB: prefixB };
+}
+
+export function compareAddressInfo(a: AddressTypeInfo, b: AddressTypeInfo): AddressSimilarityResult {
+  if (a.address === b.address) {
+    return { status: 'identical' };
+  }
+  if (a.type !== b.type) {
+    return { status: 'incomparable' };
+  }
+  if (!['p2pkh', 'p2sh', 'p2sh-p2wpkh', 'p2sh-p2wsh', 'v0_p2wpkh', 'v0_p2wsh', 'v1_p2tr'].includes(a.type)) {
+    return { status: 'incomparable' };
+  }
+  const isBase58 = a.type === 'p2pkh' || a.type === 'p2sh';
+
+  const left = fuzzyPrefixMatch(a.address, b.address);
+  const right = fuzzyPrefixMatch(a.address, b.address, true);
+  // depending on address type, some number of matching prefix characters are guaranteed
+  const prefixScore = isBase58 ? 1 : ADDRESS_PREFIXES[a.network || 'mainnet'].bech32.length;
+
+  // add the two scores together
+  const totalScore = left.score + right.score - prefixScore;
+
+  // adjust for the size of the alphabet (58 vs 32)
+  const normalizedScore = Math.pow(isBase58 ? 58 : 32, totalScore);
+
+  return {
+    status: 'comparable',
+    score: normalizedScore,
+    left: {
+      prefix: left.matchA,
+      postfix: right.matchA,
+    },
+    right: {
+      prefix: left.matchB,
+      postfix: right.matchB,
+    },
+  };
+}
+
+export function compareAddresses(a: string, b: string, network: string): AddressSimilarityResult {
+  if (a === b) {
+    return { status: 'identical' };
+  }
+  const aInfo = new AddressTypeInfo(network, a);
+  return aInfo.compareToString(b);
+}
+
+// avoids the overhead of creating AddressTypeInfo objects for each address,
+// but a and b *MUST* be valid normalized addresses, of the same valid type
+export function checkedCompareAddressStrings(a: string, b: string, type: AddressType, network: string): AddressSimilarityResult {
+  return compareAddressInfo(
+    { address: a, type: type, network: network } as AddressTypeInfo,
+    { address: b, type: type, network: network } as AddressTypeInfo,
+  );
+}
+

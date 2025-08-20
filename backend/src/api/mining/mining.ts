@@ -136,9 +136,13 @@ class Mining {
     poolsStatistics['blockCount'] = blockCount;
 
     const totalBlock24h: number = await BlocksRepository.$blockCount(null, '24h');
+    const totalBlock3d: number = await BlocksRepository.$blockCount(null, '3d');
+    const totalBlock1w: number = await BlocksRepository.$blockCount(null, '1w');
 
     try {
       poolsStatistics['lastEstimatedHashrate'] = await bitcoinClient.getNetworkHashPs(totalBlock24h);
+      poolsStatistics['lastEstimatedHashrate3d'] = await bitcoinClient.getNetworkHashPs(totalBlock3d);
+      poolsStatistics['lastEstimatedHashrate1w'] = await bitcoinClient.getNetworkHashPs(totalBlock1w);
     } catch (e) {
       poolsStatistics['lastEstimatedHashrate'] = 0;
       logger.debug('Bitcoin Core is not available, using zeroed value for current hashrate', logger.tags.mining);
@@ -252,31 +256,36 @@ class Mining {
 
         const blockStats: any = await BlocksRepository.$blockCountBetweenTimestamp(
           null, fromTimestamp / 1000, toTimestamp / 1000);
-        const lastBlockHashrate = await bitcoinClient.getNetworkHashPs(blockStats.blockCount,
-          blockStats.lastBlockHeight);
 
-        let pools = await PoolsRepository.$getPoolsInfoBetween(fromTimestamp / 1000, toTimestamp / 1000);
-        const totalBlocks = pools.reduce((acc, pool) => acc + pool.blockCount, 0);
-        if (totalBlocks > 0) {
-          pools = pools.map((pool: any) => {
-            pool.hashrate = (pool.blockCount / totalBlocks) * lastBlockHashrate;
-            pool.share = (pool.blockCount / totalBlocks);
-            return pool;
-          });
+        if (blockStats.blockCount <= 0) {
+          logger.debug(`No block found between ${fromTimestamp / 1000} and ${toTimestamp / 1000}, skipping hashrate indexing for this period`, logger.tags.mining);
+        } else {
+          const lastBlockHashrate = await bitcoinClient.getNetworkHashPs(blockStats.blockCount,
+            blockStats.lastBlockHeight);
 
-          for (const pool of pools) {
-            hashrates.push({
-              hashrateTimestamp: toTimestamp / 1000,
-              avgHashrate: pool['hashrate'] ,
-              poolId: pool.poolId,
-              share: pool['share'],
-              type: 'weekly',
+          let pools = await PoolsRepository.$getPoolsInfoBetween(fromTimestamp / 1000, toTimestamp / 1000);
+          const totalBlocks = pools.reduce((acc, pool) => acc + pool.blockCount, 0);
+          if (totalBlocks > 0) {
+            pools = pools.map((pool: any) => {
+              pool.hashrate = (pool.blockCount / totalBlocks) * lastBlockHashrate;
+              pool.share = (pool.blockCount / totalBlocks);
+              return pool;
             });
-          }
 
-          newlyIndexed += hashrates.length / Math.max(1, pools.length);
-          await HashratesRepository.$saveHashrates(hashrates);
-          hashrates.length = 0;
+            for (const pool of pools) {
+              hashrates.push({
+                hashrateTimestamp: toTimestamp / 1000,
+                avgHashrate: pool['hashrate'] ,
+                poolId: pool.poolId,
+                share: pool['share'],
+                type: 'weekly',
+              });
+            }
+
+            newlyIndexed += hashrates.length / Math.max(1, pools.length);
+            await HashratesRepository.$saveHashrates(hashrates);
+            hashrates.length = 0;
+          }
         }
 
         const elapsedSeconds = Math.max(1, Math.round((new Date().getTime() / 1000) - timer));

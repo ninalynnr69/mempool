@@ -1,4 +1,4 @@
-import { Env } from '../services/state.service';
+import { Env } from '@app/services/state.service';
 
 // all base58 characters
 export const BASE58_CHARS = `[a-km-zA-HJ-NP-Z1-9]`;
@@ -142,7 +142,7 @@ const ADDRESS_CHARS: {
 type RegexTypeNoAddrNoBlockHash = | `transaction` | `blockheight` | `date` | `timestamp`;
 export type RegexType = `address` | `blockhash` | RegexTypeNoAddrNoBlockHash;
 
-export const NETWORKS = [`testnet`, `testnet4`, `signet`, `liquid`, `liquidtestnet`, `mainnet`] as const;
+export const NETWORKS = [`mainnet`, `testnet4`, `testnet`, `signet`, `liquid`, `liquidtestnet`] as const;
 export type Network = typeof NETWORKS[number]; // Turn const array into union type
 
 export const ADDRESS_REGEXES: [RegExp, Network][] = NETWORKS
@@ -313,20 +313,24 @@ export function getRegex(type: RegexType, network?: Network): RegExp {
       }
       regex += `)`; // End the non-capturing group
       break;
-    // Match a date in the format YYYY-MM-DD (optional: HH:MM)
+    // Match a date in the format YYYY-MM-DD (optional: HH:MM or HH:MM:SS)
     // [Testing Order]: any order is fine
     case `date`:
       regex += `(?:`;                  // Start a non-capturing group
       regex += `${NUMBER_CHARS}{4}`;   // Exactly 4 digits
       regex += `[-/]`;                 // 1 instance of the symbol "-" or "/"
-      regex += `${NUMBER_CHARS}{1,2}`; // Exactly 4 digits
+      regex += `${NUMBER_CHARS}{1,2}`; // 1 or 2 digits
       regex += `[-/]`;                 // 1 instance of the symbol "-" or "/"
-      regex += `${NUMBER_CHARS}{1,2}`; // Exactly 4 digits
+      regex += `${NUMBER_CHARS}{1,2}`; // 1 or 2 digits
       regex += `(?:`;                  // Start a non-capturing group
       regex += ` `;                    // 1 instance of the symbol " "
-      regex += `${NUMBER_CHARS}{1,2}`; // Exactly 4 digits
+      regex += `${NUMBER_CHARS}{1,2}`; // 1 or 2 digits
       regex += `:`;                    // 1 instance of the symbol ":"
-      regex += `${NUMBER_CHARS}{1,2}`; // Exactly 4 digits
+      regex += `${NUMBER_CHARS}{1,2}`; // 1 or 2 digits
+      regex += `(?:`;                  // Start a non-capturing group for optional seconds
+      regex += `:`;                    // 1 instance of the symbol ":"
+      regex += `${NUMBER_CHARS}{1,2}`; // 1 or 2 digits
+      regex += `)?`;                   // End the non-capturing group
       regex += `)?`;                   // End the non-capturing group. This group appears 0 or 1 times
       regex += `)`;                    // End the non-capturing group
       break;

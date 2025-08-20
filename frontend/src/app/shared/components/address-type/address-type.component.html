@@ -20,8 +20,11 @@
   @case ('multisig') {
     <span i18n="address.bare-multisig">bare multisig</span>
   }
+  @case ('anchor') {
+    <span>anchor</span>
+  }
   @case (null) {
-    <span>unknown</span>
+    <span i18n="unknown" style="text-transform: lowercase;">Unknown</span>
   }
   @default {
     <span>{{ address.type.toUpperCase() }}</span>

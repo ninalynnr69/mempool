@@ -1,11 +1,12 @@
 import * as bitcoinjs from 'bitcoinjs-lib';
 import { AbstractBitcoinApi, HealthCheckHost } from './bitcoin-api-abstract-factory';
-import { IBitcoinApi, TestMempoolAcceptResult } from './bitcoin-api.interface';
+import { IBitcoinApi, SubmitPackageResult, TestMempoolAcceptResult } from './bitcoin-api.interface';
 import { IEsploraApi } from './esplora-api.interface';
 import blocks from '../blocks';
 import mempool from '../mempool';
 import { TransactionExtended } from '../../mempool.interfaces';
 import transactionUtils from '../transaction-utils';
+import { Common } from '../common';
 
 class BitcoinApi implements AbstractBitcoinApi {
   private rawMempoolCache: IBitcoinApi.RawMempool | null = null;
@@ -196,6 +197,10 @@ class BitcoinApi implements AbstractBitcoinApi {
     }
   }
 
+  $submitPackage(rawTransactions: string[], maxfeerate?: number, maxburnamount?: number): Promise<SubmitPackageResult> {
+    return this.bitcoindClient.submitPackage(rawTransactions, maxfeerate ?? undefined, maxburnamount ?? undefined);
+  }
+
   async $getOutspend(txId: string, vout: number): Promise<IEsploraApi.Outspend> {
     const txOut = await this.bitcoindClient.getTxOut(txId, vout, false);
     return {
@@ -251,6 +256,10 @@ class BitcoinApi implements AbstractBitcoinApi {
     return this.$getRawTransaction(txids[0]);
   }
 
+  async $getAddressTransactionSummary(address: string): Promise<IEsploraApi.AddressTxSummary[]> {
+    throw new Error('Method getAddressTransactionSummary not supported by the Bitcoin RPC API.');
+  }
+
   $getEstimatedHashrate(blockHeight: number): Promise<number> {
     // 120 is the default block span in Core
     return this.bitcoindClient.getNetworkHashPs(120, blockHeight);
@@ -285,7 +294,7 @@ class BitcoinApi implements AbstractBitcoinApi {
         is_coinbase: !!vin.coinbase,
         prevout: null,
         scriptsig: vin.scriptSig && vin.scriptSig.hex || vin.coinbase || '',
-        scriptsig_asm: vin.scriptSig && transactionUtils.convertScriptSigAsm(vin.scriptSig.hex) || '',
+        scriptsig_asm: vin.scriptSig ? transactionUtils.convertScriptSigAsm(vin.scriptSig.hex) : (vin.coinbase ? transactionUtils.convertScriptSigAsm(vin.coinbase) : ''),
         sequence: vin.sequence,
         txid: vin.txid || '',
         vout: vin.vout || 0,
@@ -323,6 +332,7 @@ class BitcoinApi implements AbstractBitcoinApi {
       'witness_v1_taproot': 'v1_p2tr',
       'nonstandard': 'nonstandard',
       'multisig': 'multisig',
+      'anchor': 'anchor',
       'nulldata': 'op_return'
     };
 
@@ -351,6 +361,7 @@ class BitcoinApi implements AbstractBitcoinApi {
   }
 
   protected async $addPrevouts(transaction: TransactionExtended): Promise<TransactionExtended> {
+    let addedPrevouts = false;
     for (const vin of transaction.vin) {
       if (vin.prevout) {
         continue;
@@ -358,6 +369,12 @@ class BitcoinApi implements AbstractBitcoinApi {
       const innerTx = await this.$getRawTransaction(vin.txid, false, false);
       vin.prevout = innerTx.vout[vin.vout];
       transactionUtils.addInnerScriptsToVin(vin);
+      addedPrevouts = true;
+    }
+    if (addedPrevouts) {
+      // re-calculate transaction flags now that we have full prevout data
+      transaction.flags = undefined; // clear existing flags to force full classification
+      transaction.flags = Common.getTransactionFlags(transaction, transaction.status?.block_height ?? blocks.getCurrentBlockHeight());
     }
     return transaction;
   }
